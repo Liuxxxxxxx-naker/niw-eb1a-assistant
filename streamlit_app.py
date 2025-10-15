@@ -12,10 +12,7 @@ You are a senior U.S. immigration petition advisor and academic evaluator.
 Regardless of input language, respond in English only with a single valid JSON object in the following schema and nothing else.
 If you cannot process, return {"error": "Unable to process the input."}
 {
-  "analysis_summary": {
-    "field_of_expertise": "string",
-    "key_achievements": "string"
-  },
+  "analysis_summary": {"field_of_expertise": "string","key_achievements": "string"},
   "prong_analysis": {
     "prong_1": {"score": 0, "reasoning": "string", "suggestions": "string"},
     "prong_2": {"score": 0, "reasoning": "string", "suggestions": "string"},
@@ -27,12 +24,12 @@ If you cannot process, return {"error": "Unable to process the input."}
     "success_probability_eb1a": "string",
     "overall_suggestions": "string"
   },
-  "future_plan_draft": ["string", "string", "string"]
+  "future_plan_draft": ["string","string","string"]
 }
 """
 
 USER_PROMPT_TEMPLATE = """
-Please analyze the following NIW/EB-1A applicant. Input can be Chinese or English, but your output must be **English JSON** exactly per the schema.
+Please analyze the following NIW/EB-1A applicant. Input can be Chinese or English, but your output must be English JSON exactly per the schema.
 
 Applicant profile:
 ---
@@ -112,20 +109,25 @@ reviewer = st.text_area("Peer-review Experience (optional)", height=70)
 
 st.subheader("② Publications（可直接编辑）")
 if "pubs" not in st.session_state:
-    st.session_state.pubs = [{"title": "", "journal": "", "year": "", "citations": 0, "countries": "US;CN"}]
-pubs_df = st.data_editor(
+    st.session_state.pubs = [{"title":"", "journal":"", "year":"", "citations":0, "countries":"US;CN"}]
+
+pubs_edited = st.data_editor(
     st.session_state.pubs,
     num_rows="dynamic",
     use_container_width=True,
-    columns={
-        "title": "Title",
-        "journal": "Journal",
-        "year": "Year",
-        "citations": "Citations",
-        "countries": "Cited by Countries (US;CN;DE)"
+    column_config={
+        "title": st.column_config.TextColumn("Title", width="medium"),
+        "journal": st.column_config.TextColumn("Journal", width="medium"),
+        "year": st.column_config.TextColumn("Year", width="small"),
+        "citations": st.column_config.NumberColumn("Citations", min_value=0, step=1),
+        "countries": st.column_config.TextColumn("Cited by Countries (US;CN;DE)")
     },
 )
-st.session_state.pubs = pubs_df
+# 统一为 list[dict]
+if hasattr(pubs_edited, "to_dict"):
+    st.session_state.pubs = pubs_edited.to_dict("records")
+else:
+    st.session_state.pubs = pubs_edited
 
 st.subheader("③ Additional Notes (optional)")
 extra = st.text_area("Any context the model should consider", height=100)
@@ -138,12 +140,10 @@ def build_user_input() -> str:
     if awards: lines.append(f"Awards: {awards}")
     if reviewer: lines.append(f"Reviewer: {reviewer}")
     pubs_lines = []
-    for p in pubs_df:
+    for p in st.session_state.pubs:
         t = (p.get("title") or "").strip()
         if not t: continue
-        pubs_lines.append(
-            f'- "{t}" ({p.get("journal","")}, {p.get("year","")}), citations={p.get("citations",0)}, cited_countries="{p.get("countries","")}"'
-        )
+        pubs_lines.append(f'- "{t}" ({p.get("journal","")}, {p.get("year","")}), citations={p.get("citations",0)}, cited_countries="{p.get("countries","")}"')
     if pubs_lines:
         lines.append("Publications:\n" + "\n".join(pubs_lines))
     if extra:
