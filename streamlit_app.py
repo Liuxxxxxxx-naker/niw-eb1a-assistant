@@ -1,113 +1,73 @@
-import os
-import re
-import json
-import requests
-import streamlit as st
-from collections import defaultdict
+import os, re, json, requests, streamlit as st
 
-# -----------------------------
-# 0) 全局配置
-# -----------------------------
 API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
-MODEL_ID = "GLM-4.6"  # 统一使用这个大小写
+MODEL_ID = "GLM-4.6"
 
 st.set_page_config(page_title="NIW/EB-1A 智能评估助手", layout="wide")
 st.title("🧑‍⚖️ NIW / EB-1A 智能评估助手")
-st.markdown("基于 **GLM-4.6**，模拟 USCIS 审查逻辑，输出：Prong 分析、成功率与 Future Plan。")
+st.caption("基于 GLM-4.6。输入可为中/英，输出统一英文 JSON 报告。")
 
-# -----------------------------
-# 1) 提示词
-# -----------------------------
 SYSTEM_PROMPT = r"""
-你是一位顶尖的美国移民律师顾问，同时精通学术数据分析和USCIS（美国公民及移民服务局）的NIW（国家利益豁免）和EB-1A（杰出人才）申请审查逻辑。
-你的任务是分析用户提供的科研背景资料，并模拟USCIS的审查标准，给出一份全面、专业的评估报告。
-你必须严格遵循以下输出格式要求：
-1.  你的全部回答必须是一个单一、有效的JSON对象。
-2.  不要在JSON对象前后添加任何解释性文字、代码块标记（如```json）或任何其他内容。
-3.  如果无法分析，请返回一个包含 "error": "Unable to process the input." 的JSON对象。
-JSON对象的结构必须如下：
+You are a senior U.S. immigration petition advisor and academic evaluator.
+Regardless of input language, respond in English only with a single valid JSON object in the following schema and nothing else.
+If you cannot process, return {"error": "Unable to process the input."}
 {
   "analysis_summary": {
-    "field_of_expertise": "申请人的专业领域",
-    "key_achievements": "主要成就的简要总结"
+    "field_of_expertise": "string",
+    "key_achievements": "string"
   },
   "prong_analysis": {
-    "prong_1": {
-      "score": 8,
-      "reasoning": "论证过程，解释为什么满足或不满足Substantial Merit and National Importance。",
-      "suggestions": "针对Prong 1的补强建议。"
-    },
-    "prong_2": {
-      "score": 7,
-      "reasoning": "论证过程，解释为什么申请人Well-Positioned to Advance the Field。",
-      "suggestions": "针对Prong 2的补强建议。"
-    },
-    "prong_3": {
-      "score": 9,
-      "reasoning": "论证过程，解释为什么Benefit to the U.S. outweighs Labor Certification。",
-      "suggestions": "针对Prong 3的补强建议。"
-    }
+    "prong_1": {"score": 0, "reasoning": "string", "suggestions": "string"},
+    "prong_2": {"score": 0, "reasoning": "string", "suggestions": "string"},
+    "prong_3": {"score": 0, "reasoning": "string", "suggestions": "string"}
   },
   "overall_assessment": {
-    "total_score": 24,
-    "success_probability_niw": "高",
-    "success_probability_eb1a": "中",
-    "overall_suggestions": "综合补强建议，包括证据类型、寻找推荐信的人选等。"
+    "total_score": 0,
+    "success_probability_niw": "string",
+    "success_probability_eb1a": "string",
+    "overall_suggestions": "string"
   },
-  "future_plan_draft": [
-    "第一条未来计划，与申请人研究方向衔接，体现美国国家意义。",
-    "第二条未来计划，语言积极、可信、有行动路线。",
-    "第三条未来计划，可以涉及教学、合作或技术转化。"
-  ]
+  "future_plan_draft": ["string", "string", "string"]
 }
 """
 
 USER_PROMPT_TEMPLATE = """
-请根据以下申请人提供的科研资料，进行NIW/EB-1A智能评估。
-申请人科研资料：
+Please analyze the following NIW/EB-1A applicant. Input can be Chinese or English, but your output must be **English JSON** exactly per the schema.
+
+Applicant profile:
 ---
 {user_input}
 ---
-请严格按照系统提示词中定义的JSON格式输出你的评估报告。
+Strictly output the JSON only, no extra text.
 """
 
-# -----------------------------
-# 2) 工具函数
-# -----------------------------
-def get_api_key():
-    # 优先 secrets → 环境变量 → 页面输入
+def strip_code_fences(s: str) -> str:
+    s = s.strip()
+    s = re.sub(r"^```.*?\n", "", s, flags=re.S)
+    s = re.sub(r"\n```$", "", s, flags=re.S)
+    return s.strip()
+
+def extract_first_json(s: str) -> str:
+    s = strip_code_fences(s)
+    i, j = s.find("{"), s.rfind("}")
+    return s[i:j+1] if i != -1 and j != -1 and j > i else s
+
+def get_api_key() -> str:
     key = None
     try:
         key = st.secrets["ZHIPU_API_KEY"]
     except Exception:
         key = os.getenv("ZHIPU_API_KEY")
-
     if not key:
-        st.info("未检测到 API Key，请在下方输入（仅保存在本页会话中）。")
+        st.info("未检测到 API Key，请在下方输入（仅本会话保存）。")
         key = st.text_input("ZHIPU_API_KEY", type="password")
         if key:
             st.session_state["_ZHIPU_API_KEY_USER"] = key
         else:
             key = st.session_state.get("_ZHIPU_API_KEY_USER")
-
     return key
 
-def strip_code_fences(text: str) -> str:
-    # 去掉 ```json ... ``` 或 ``` ... ``` 围栏
-    text = re.sub(r"^```.*?\n", "", text.strip(), flags=re.S)
-    text = re.sub(r"\n```$", "", text.strip(), flags=re.S)
-    return text.strip()
-
-def extract_first_json(text: str) -> str:
-    # 保底：提取第一个“{ ... }”大括号包裹的对象
-    s = strip_code_fences(text)
-    start = s.find("{")
-    end = s.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        return s[start:end+1]
-    return s  # 就按原文返回，交给 json.loads 去尝试
-
-def call_glm(user_input_text: str, api_key: str) -> dict:
+def call_glm(user_input_text: str, api_key: str, temperature: float = 0.2) -> dict:
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {
         "model": MODEL_ID,
@@ -115,95 +75,157 @@ def call_glm(user_input_text: str, api_key: str) -> dict:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": USER_PROMPT_TEMPLATE.format(user_input=user_input_text)}
         ],
-        "temperature": 0.2
+        "temperature": float(temperature),
     }
+    resp = None
     try:
         resp = requests.post(API_URL, headers=headers, json=payload, timeout=60)
         resp.raise_for_status()
         data = resp.json()
         content = data["choices"][0]["message"]["content"]
     except requests.exceptions.RequestException as e:
-        return {"error": f"API request failed: {e}", "raw_response": getattr(resp, "text", "")}
+        return {"error": f"API request failed: {e}", "raw_response": resp.text if resp else ""}
     except (KeyError, ValueError) as e:
-        return {"error": f"Unexpected API response structure: {e}", "raw_response": getattr(resp, "text", "")}
+        return {"error": f"Unexpected API response structure: {e}", "raw_response": resp.text if resp else ""}
 
-    # 尝试解析严格 JSON
     raw = extract_first_json(content)
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
         return {"error": "Failed to decode JSON from model response.", "raw_content": content}
 
-# -----------------------------
-# 3) 页面与流程
-# -----------------------------
-if "user_input" not in st.session_state:
-    st.session_state.user_input = ""
+with st.sidebar:
+    st.header("⚙️ Settings")
+    API_KEY = get_api_key()
+    temperature = st.slider("Temperature", 0.0, 1.0, 0.2, 0.1)
+    show_raw = st.toggle("Show raw response (debug)", value=False)
+    st.markdown("---")
+    st.caption("建议：先在左侧填入 API Key。")
 
-api_key = get_api_key()
-with st.form("assessment_form"):
-    st.subheader("第一步：请输入您的科研资料")
-    user_input = st.text_area(
-        "请详细描述研究方向、代表论文（期刊/影响因子/引用）、审稿经历、奖项、合作等。",
-        height=300,
-        value=st.session_state.user_input
-    )
-    submitted = st.form_submit_button("开始智能评估")
+st.subheader("① 基本信息")
+c1, c2 = st.columns(2)
+name = c1.text_input("Name / Applicant")
+field = c2.text_input("Field of Study")
+institutions = st.text_input("Affiliations / Collaborations (comma separated)")
+awards = st.text_area("Awards / Grants (optional)", height=70)
+reviewer = st.text_area("Peer-review Experience (optional)", height=70)
 
-if submitted:
-    if not api_key:
-        st.error("缺少 ZHIPU_API_KEY：请配置 Streamlit Secrets 或在页面输入框里填入。")
+st.subheader("② Publications（可直接编辑）")
+if "pubs" not in st.session_state:
+    st.session_state.pubs = [{"title": "", "journal": "", "year": "", "citations": 0, "countries": "US;CN"}]
+pubs_df = st.data_editor(
+    st.session_state.pubs,
+    num_rows="dynamic",
+    use_container_width=True,
+    columns={
+        "title": "Title",
+        "journal": "Journal",
+        "year": "Year",
+        "citations": "Citations",
+        "countries": "Cited by Countries (US;CN;DE)"
+    },
+)
+st.session_state.pubs = pubs_df
+
+st.subheader("③ Additional Notes (optional)")
+extra = st.text_area("Any context the model should consider", height=100)
+
+def build_user_input() -> str:
+    lines = []
+    if name: lines.append(f"Name: {name}")
+    if field: lines.append(f"Field: {field}")
+    if institutions: lines.append(f"Collaborations: {institutions}")
+    if awards: lines.append(f"Awards: {awards}")
+    if reviewer: lines.append(f"Reviewer: {reviewer}")
+    pubs_lines = []
+    for p in pubs_df:
+        t = (p.get("title") or "").strip()
+        if not t: continue
+        pubs_lines.append(
+            f'- "{t}" ({p.get("journal","")}, {p.get("year","")}), citations={p.get("citations",0)}, cited_countries="{p.get("countries","")}"'
+        )
+    if pubs_lines:
+        lines.append("Publications:\n" + "\n".join(pubs_lines))
+    if extra:
+        lines.append("Notes:\n" + extra)
+    return "\n".join(lines).strip()
+
+run = st.button("🚀 开始智能评估", use_container_width=True)
+
+if run:
+    if not API_KEY:
+        st.error("缺少 ZHIPU_API_KEY。请在侧边栏输入或配置 Secrets/环境变量。")
         st.stop()
-    if not user_input.strip():
-        st.warning("请输入科研资料后再评估。")
+    user_input_text = build_user_input()
+    if not user_input_text:
+        st.warning("请至少填写基本信息或一篇论文。")
         st.stop()
 
-    st.session_state.user_input = user_input
-    with st.spinner("🤖 GLM-4.6 正在分析中..."):
-        report = call_glm(user_input, api_key)
+    with st.spinner("GLM-4.6 正在评估…"):
+        report = call_glm(user_input_text, API_KEY, temperature=temperature)
 
     if "error" in report:
-        st.error(f"分析失败：{report['error']}")
-        if "raw_content" in report:
-            with st.expander("查看模型原始输出"):
+        st.error(f"失败：{report['error']}")
+        if show_raw and "raw_content" in report:
+            with st.expander("Raw Model Output"):
                 st.code(report["raw_content"])
-        if "raw_response" in report:
-            with st.expander("查看API原始响应"):
+        if show_raw and "raw_response" in report:
+            with st.expander("Raw API Response"):
                 st.code(report["raw_response"])
         st.stop()
 
-    # -------------------------
-    # 4) 结果展示
-    # -------------------------
-    st.success("✅ 评估完成！")
-    st.header("评估报告")
+    st.success("✅ Completed")
+    st.header("Evaluation Report")
 
-    # 分析摘要
-    st.subheader("📄 分析摘要")
-    col1, col2 = st.columns(2)
-    col1.write(f"**专业领域：** {report['analysis_summary'].get('field_of_expertise','-')}")
-    col2.write(f"**关键成就：** {report['analysis_summary'].get('key_achievements','-')}")
+    st.subheader("📄 Analysis Summary")
+    a = report.get("analysis_summary", {})
+    x1, x2 = st.columns(2)
+    x1.write(f"**Field of Expertise:** {a.get('field_of_expertise','-')}")
+    x2.write(f"**Key Achievements:** {a.get('key_achievements','-')}")
 
-    # Prong 分析
-    st.subheader("⚖️ USCIS Prong 详细分析")
-    for prong_key in ("prong_1", "prong_2", "prong_3"):
-        pr = report.get("prong_analysis", {}).get(prong_key, {})
-        score = pr.get("score", "-")
-        with st.expander(f"{prong_key.replace('_',' ').title()}  |  Score: {score}/10"):
-            st.write(f"**论证逻辑：** {pr.get('reasoning','-')}")
-            st.info(f"**补强建议：** {pr.get('suggestions','-')}")
+    st.subheader("⚖️ USCIS Prongs")
+    for k, label in [("prong_1","Prong 1"), ("prong_2","Prong 2"), ("prong_3","Prong 3")]:
+        pr = report.get("prong_analysis", {}).get(k, {})
+        with st.expander(f"{label} | Score: {pr.get('score','-')}/10", expanded=False):
+            st.write(f"**Reasoning:** {pr.get('reasoning','-')}")
+            st.info(f"**Suggestions:** {pr.get('suggestions','-')}")
 
-    # 综合评估
-    st.subheader("📊 综合评估")
+    st.subheader("📊 Overall Assessment")
     oa = report.get("overall_assessment", {})
-    c1, c2, c3 = st.columns(3)
-    c1.metric("NIW 成功概率", oa.get("success_probability_niw", "-"))
-    c2.metric("EB-1A 成功概率", oa.get("success_probability_eb1a", "-"))
-    c3.metric("综合得分", oa.get("total_score", "-"))
-    st.write(f"**综合建议：** {oa.get('overall_suggestions','-')}")
+    y1, y2, y3 = st.columns(3)
+    y1.metric("NIW Probability", oa.get("success_probability_niw","-"))
+    y2.metric("EB-1A Probability", oa.get("success_probability_eb1a","-"))
+    y3.metric("Total Score", oa.get("total_score","-"))
+    st.write(f"**Overall Suggestions:** {oa.get('overall_suggestions','-')}")
 
-    # Future Plan
-    st.subheader("🧭 Future Plan 写作建议")
+    st.subheader("🧭 Future Plan (Draft)")
     for i, plan in enumerate(report.get("future_plan_draft", []), start=1):
         st.write(f"{i}. {plan}")
 
+    md = []
+    md += ["# NIW/EB-1A Evaluation Report", "## Analysis Summary"]
+    md += [f"- Field of Expertise: {a.get('field_of_expertise','-')}",
+           f"- Key Achievements: {a.get('key_achievements','-')}",
+           "## USCIS Prongs"]
+    for k, label in [("prong_1","Prong 1"), ("prong_2","Prong 2"), ("prong_3","Prong 3")]:
+        pr = report.get("prong_analysis", {}).get(k, {})
+        md += [f"### {label} (Score: {pr.get('score','-')}/10)",
+               f"- Reasoning: {pr.get('reasoning','-')}",
+               f"- Suggestions: {pr.get('suggestions','-')}"]
+    md += ["## Overall Assessment",
+           f"- NIW Probability: {oa.get('success_probability_niw','-')}",
+           f"- EB-1A Probability: {oa.get('success_probability_eb1a','-')}",
+           f"- Total Score: {oa.get('total_score','-')}",
+           f"- Overall Suggestions: {oa.get('overall_suggestions','-')}",
+           "## Future Plan (Draft)"]
+    for p in report.get("future_plan_draft", []):
+        md.append(f"- {p}")
+    st.download_button("📥 Download Markdown", "\n".join(md), file_name="niw_eb1a_report.md", mime="text/markdown")
+
+st.markdown("""
+<style>
+    .stButton>button { border-radius: 10px; height: 3rem; font-weight: 600; }
+    .stTextInput input, .stTextArea textarea { border-radius: 10px; }
+    .stDataFrame, .stDataEditor { border-radius: 10px; }
+</style>
+""", unsafe_allow_html=True)
