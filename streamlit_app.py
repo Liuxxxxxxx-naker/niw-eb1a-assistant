@@ -1,8 +1,21 @@
-import os, re, json, requests, pandas as pd, plotly.express as px, streamlit as st
+import os
+import re
+import json
+import requests
+import pandas as pd
+import plotly.express as px
+import streamlit as st
 
 API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
 MODEL_ID = "GLM-4.6"
 OPENALEX = "https://api.openalex.org"
+
+ISO2_TO_ISO3 = {
+    "US":"USA","CN":"CHN","DE":"DEU","JP":"JPN","GB":"GBR","UK":"GBR","FR":"FRA","CA":"CAN","AU":"AUS",
+    "IT":"ITA","ES":"ESP","KR":"KOR","IN":"IND","NL":"NLD","SE":"SWE","NO":"NOR","FI":"FIN","DK":"DNK",
+    "CH":"CHE","AT":"AUT","BE":"BEL","SG":"SGP","HK":"HKG","TW":"TWN","IL":"ISR","SA":"SAU","AE":"ARE",
+    "RU":"RUS","BR":"BRA","MX":"MEX","ZA":"ZAF","PL":"POL","TR":"TUR"
+}
 
 st.set_page_config(page_title="NIW/EB-1A 智能评估助手", layout="wide")
 st.title("🧑‍⚖️ NIW / EB-1A 智能评估助手")
@@ -145,7 +158,11 @@ def draw_country_map(country_counts: dict, title="Citing Countries (OpenAlex)"):
     if not country_counts:
         st.info("No citing countries found.")
         return
-    df = pd.DataFrame([{"country": k, "count": v} for k, v in country_counts.items()])
+    rows = []
+    for k, v in country_counts.items():
+        cc3 = ISO2_TO_ISO3.get(k.upper(), k.upper())
+        rows.append({"country": cc3, "count": v})
+    df = pd.DataFrame(rows)
     fig = px.choropleth(df, locations="country", color="count",
                         color_continuous_scale="Blues", locationmode="ISO-3", title=title)
     st.plotly_chart(fig, use_container_width=True)
@@ -203,8 +220,7 @@ if fetch_btn:
         with st.expander("本篇引用国家分布地图"):
             draw_country_map(cc, title=f"Countries citing: {title[:50]}...")
         with st.expander("二级影响 Top10（引用你的论文的论文中，被引最多）"):
-            top2 = second_order_reach(citing_list, top_k=10)
-            for t, c, wid in top2:
+            for t, c, wid in second_order_reach(citing_list, top_k=10):
                 st.write(f"- {t}  | cited_by={c}  | {wid}")
 
 if clear_btn:
@@ -263,8 +279,8 @@ if run:
     if not API_KEY:
         st.error("缺少 ZHIPU_API_KEY。请在侧边栏输入或配置 Secrets/环境变量。")
         st.stop()
-    user_input_text = build_user_input()
-    if not user_input_text:
+    ui_text = build_user_input()
+    if not ui_text:
         st.warning("请至少填写基本信息或一篇论文。")
         st.stop()
 
@@ -278,7 +294,7 @@ if run:
     draw_country_map(all_cc, title="Citing Countries (all listed publications)")
 
     with st.spinner("GLM-4.6 正在评估…"):
-        report = call_glm(user_input_text, API_KEY, temperature=temperature)
+        report = call_glm(ui_text, API_KEY, temperature=temperature)
 
     if "error" in report:
         st.error(f"失败：{report['error']}")
@@ -332,7 +348,8 @@ if run:
            f"- Total Score: {oa.get('total_score','-')}",
            f"- Overall Suggestions: {oa.get('overall_suggestions','-')}",
            "## Future Plan (Draft)"]
-    for p in report.get("future_plan_draft", []): md.append(f"- {p}")
+    for p in report.get("future_plan_draft", []):
+        md.append(f"- {p}")
     st.download_button("📥 Download Markdown", "\n".join(md), file_name="niw_eb1a_report.md", mime="text/markdown")
 
 st.markdown("""
