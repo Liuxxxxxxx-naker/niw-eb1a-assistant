@@ -2,7 +2,7 @@
 	import streamlit as st
 	import requests
 	import json
-	# --- 1. 提示词模板 (定义GLM-4.6的角色和任务) ---
+		# --- 1. 提示词模板 (定义GLM-4.6的角色和任务) ---
 	SYSTEM_PROMPT = """
 	你是一位顶尖的美国移民律师顾问，同时精通学术数据分析和USCIS（美国公民及移民服务局）的NIW（国家利益豁免）和EB-1A（杰出人才）申请审查逻辑。
 	你的任务是分析用户提供的科研背景资料，并模拟USCIS的审查标准，给出一份全面、专业的评估报告。
@@ -134,4 +134,5 @@
 	                # Future Plan
 	                st.subheader("🧭 Future Plan 写作建议")
 	                for i, plan in enumerate(report['future_plan_draft']):
+
 	                    st.write(f"{i+1}. {plan}")
