@@ -1,15 +1,16 @@
-import os, re, json, requests, streamlit as st
+import os, re, json, requests, pandas as pd, plotly.express as px, streamlit as st
 
 API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
 MODEL_ID = "GLM-4.6"
+OPENALEX = "https://api.openalex.org"
 
 st.set_page_config(page_title="NIW/EB-1A 智能评估助手", layout="wide")
 st.title("🧑‍⚖️ NIW / EB-1A 智能评估助手")
-st.caption("基于 GLM-4.6。输入可为中/英，输出统一英文 JSON 报告。")
+st.caption("基于 GLM-4.6。输入可为中/英，输出统一英文 JSON 报告 + 地图。")
 
 SYSTEM_PROMPT = r"""
 You are a senior U.S. immigration petition advisor and academic evaluator.
-Regardless of input language, respond in English only with a single valid JSON object in the following schema and nothing else.
+Regardless of input language, respond in English only with a single valid JSON object in the schema below and nothing else.
 If you cannot process, return {"error": "Unable to process the input."}
 {
   "analysis_summary": {"field_of_expertise": "string","key_achievements": "string"},
@@ -84,12 +85,70 @@ def call_glm(user_input_text: str, api_key: str, temperature: float = 0.2) -> di
         return {"error": f"API request failed: {e}", "raw_response": resp.text if resp else ""}
     except (KeyError, ValueError) as e:
         return {"error": f"Unexpected API response structure: {e}", "raw_response": resp.text if resp else ""}
-
     raw = extract_first_json(content)
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
         return {"error": "Failed to decode JSON from model response.", "raw_content": content}
+
+def ox_get(url, params=None):
+    r = requests.get(url, params=params or {}, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def resolve_work_by_title(title):
+    j = ox_get(f"{OPENALEX}/works", {"search": title, "per-page": 1})
+    items = j.get("results", [])
+    return items[0] if items else None
+
+def resolve_work_by_doi(doi):
+    doi = doi.lower().strip().replace("https://doi.org/", "")
+    try:
+        return ox_get(f"{OPENALEX}/works/doi:{doi}")
+    except Exception:
+        return None
+
+def get_citing_works(openalex_id, per_page=200, max_pages=10):
+    all_items, cursor = [], "*"
+    for _ in range(max_pages):
+        j = ox_get(f"{OPENALEX}/works", {"filter": f"cites:{openalex_id}", "per-page": per_page, "cursor": cursor})
+        items = j.get("results", [])
+        all_items.extend(items)
+        cursor = j.get("meta", {}).get("next_cursor")
+        if not cursor or not items: break
+    return all_items
+
+def countries_from_authorships(item):
+    countries = []
+    for a in item.get("authorships", []):
+        for inst in a.get("institutions", []):
+            cc = inst.get("country_code")
+            if cc: countries.append(cc.upper())
+    return countries
+
+def aggregate_citing_countries(openalex_id):
+    citing = get_citing_works(openalex_id)
+    counts = {}
+    for w in citing:
+        for c in countries_from_authorships(w):
+            counts[c] = counts.get(c, 0) + 1
+    return counts, citing
+
+def second_order_reach(citing_list, top_k=10):
+    ranked = sorted(
+        [(w.get("display_name",""), w.get("cited_by_count",0), w.get("id","")) for w in citing_list],
+        key=lambda x: x[1], reverse=True
+    )
+    return ranked[:top_k]
+
+def draw_country_map(country_counts: dict, title="Citing Countries (OpenAlex)"):
+    if not country_counts:
+        st.info("No citing countries found.")
+        return
+    df = pd.DataFrame([{"country": k, "count": v} for k, v in country_counts.items()])
+    fig = px.choropleth(df, locations="country", color="count",
+                        color_continuous_scale="Blues", locationmode="ISO-3", title=title)
+    st.plotly_chart(fig, use_container_width=True)
 
 with st.sidebar:
     st.header("⚙️ Settings")
@@ -97,7 +156,7 @@ with st.sidebar:
     temperature = st.slider("Temperature", 0.0, 1.0, 0.2, 0.1)
     show_raw = st.toggle("Show raw response (debug)", value=False)
     st.markdown("---")
-    st.caption("建议：先在左侧填入 API Key。")
+    st.caption("左侧先填 API Key；下方可自动解析论文到表格。")
 
 st.subheader("① 基本信息")
 c1, c2 = st.columns(2)
@@ -107,8 +166,48 @@ institutions = st.text_input("Affiliations / Collaborations (comma separated)")
 awards = st.text_area("Awards / Grants (optional)", height=70)
 reviewer = st.text_area("Peer-review Experience (optional)", height=70)
 
+st.subheader("② 数据来源")
+source = st.radio("选择论文来源", ["手动输入/表格", "按标题快速解析（OpenAlex）", "按 DOI 快速解析（OpenAlex）"], horizontal=True)
+title_input = doi_input = ""
+if source == "按标题快速解析（OpenAlex）":
+    title_input = st.text_input("输入论文标题（支持逐篇解析后加入）")
+elif source == "按 DOI 快速解析（OpenAlex）":
+    doi_input = st.text_input("输入 DOI（如 10.1021/acsami.xxxxxxx）")
+
+colF1, colF2 = st.columns([1,1])
+fetch_btn = colF1.button("🔎 解析并加入到 Publications")
+clear_btn = colF2.button("🧹 清空 Publications")
+
 st.subheader("② Publications（可直接编辑）")
 if "pubs" not in st.session_state:
+    st.session_state.pubs = [{"title":"", "journal":"", "year":"", "citations":0, "countries":"US;CN"}]
+
+if fetch_btn:
+    item = None
+    if source.startswith("按标题") and title_input.strip():
+        item = resolve_work_by_title(title_input.strip())
+    elif source.startswith("按 DOI") and doi_input.strip():
+        item = resolve_work_by_doi(doi_input.strip())
+    if not item:
+        st.warning("未解析到论文。")
+    else:
+        title = item.get("display_name","")
+        venue = (item.get("host_venue",{}) or {}).get("display_name","")
+        year  = (item.get("publication_year") or "")
+        cites = item.get("cited_by_count", 0)
+        cc, citing_list = aggregate_citing_countries(item["id"])
+        cc_str = ";".join(sorted(cc.keys()))
+        st.session_state.pubs.append({"title": title, "journal": venue, "year": year,
+                                      "citations": cites, "countries": cc_str})
+        st.success("已加入 Publications。下方表格可继续编辑。")
+        with st.expander("本篇引用国家分布地图"):
+            draw_country_map(cc, title=f"Countries citing: {title[:50]}...")
+        with st.expander("二级影响 Top10（引用你的论文的论文中，被引最多）"):
+            top2 = second_order_reach(citing_list, top_k=10)
+            for t, c, wid in top2:
+                st.write(f"- {t}  | cited_by={c}  | {wid}")
+
+if clear_btn:
     st.session_state.pubs = [{"title":"", "journal":"", "year":"", "citations":0, "countries":"US;CN"}]
 
 pubs_edited = st.data_editor(
@@ -123,11 +222,7 @@ pubs_edited = st.data_editor(
         "countries": st.column_config.TextColumn("Cited by Countries (US;CN;DE)")
     },
 )
-# 统一为 list[dict]
-if hasattr(pubs_edited, "to_dict"):
-    st.session_state.pubs = pubs_edited.to_dict("records")
-else:
-    st.session_state.pubs = pubs_edited
+st.session_state.pubs = pubs_edited.to_dict("records") if hasattr(pubs_edited, "to_dict") else pubs_edited
 
 st.subheader("③ Additional Notes (optional)")
 extra = st.text_area("Any context the model should consider", height=100)
@@ -139,15 +234,27 @@ def build_user_input() -> str:
     if institutions: lines.append(f"Collaborations: {institutions}")
     if awards: lines.append(f"Awards: {awards}")
     if reviewer: lines.append(f"Reviewer: {reviewer}")
-    pubs_lines = []
+    pubs_lines, total_cites, all_cc = [], 0, {}
     for p in st.session_state.pubs:
         t = (p.get("title") or "").strip()
         if not t: continue
-        pubs_lines.append(f'- "{t}" ({p.get("journal","")}, {p.get("year","")}), citations={p.get("citations",0)}, cited_countries="{p.get("countries","")}"')
+        cnum = int(p.get("citations") or 0)
+        total_cites += cnum
+        for cc in (p.get("countries","") or "").split(";"):
+            cc = cc.strip().upper()
+            if not cc: continue
+            all_cc[cc] = all_cc.get(cc, 0) + 1
+        pubs_lines.append(f'- "{t}" ({p.get("journal","")}, {p.get("year","")}), citations={cnum}, cited_countries="{p.get("countries","")}"')
     if pubs_lines:
         lines.append("Publications:\n" + "\n".join(pubs_lines))
-    if extra:
-        lines.append("Notes:\n" + extra)
+    if all_cc:
+        top_cc = sorted(all_cc.items(), key=lambda x: x[1], reverse=True)[:10]
+        cc_str = ", ".join([f"{k}:{v}" for k,v in top_cc])
+        lines.append("Bibliometrics Summary:\n" +
+                     f"- Total citations (sum of listed): {total_cites}\n" +
+                     f"- Top citing countries (count of papers that cite you): {cc_str}\n" +
+                     "- Note: Country stats come from OpenAlex citing-works institutions.")
+    if extra: lines.append("Notes:\n" + extra)
     return "\n".join(lines).strip()
 
 run = st.button("🚀 开始智能评估", use_container_width=True)
@@ -161,17 +268,24 @@ if run:
         st.warning("请至少填写基本信息或一篇论文。")
         st.stop()
 
+    st.subheader("🌍 Citing Countries Overview")
+    all_cc = {}
+    for p in st.session_state.pubs:
+        for cc in (p.get("countries","") or "").split(";"):
+            cc = cc.strip().upper()
+            if not cc: continue
+            all_cc[cc] = all_cc.get(cc, 0) + 1
+    draw_country_map(all_cc, title="Citing Countries (all listed publications)")
+
     with st.spinner("GLM-4.6 正在评估…"):
         report = call_glm(user_input_text, API_KEY, temperature=temperature)
 
     if "error" in report:
         st.error(f"失败：{report['error']}")
         if show_raw and "raw_content" in report:
-            with st.expander("Raw Model Output"):
-                st.code(report["raw_content"])
+            with st.expander("Raw Model Output"): st.code(report["raw_content"])
         if show_raw and "raw_response" in report:
-            with st.expander("Raw API Response"):
-                st.code(report["raw_response"])
+            with st.expander("Raw API Response"): st.code(report["raw_response"])
         st.stop()
 
     st.success("✅ Completed")
@@ -218,8 +332,7 @@ if run:
            f"- Total Score: {oa.get('total_score','-')}",
            f"- Overall Suggestions: {oa.get('overall_suggestions','-')}",
            "## Future Plan (Draft)"]
-    for p in report.get("future_plan_draft", []):
-        md.append(f"- {p}")
+    for p in report.get("future_plan_draft", []): md.append(f"- {p}")
     st.download_button("📥 Download Markdown", "\n".join(md), file_name="niw_eb1a_report.md", mime="text/markdown")
 
 st.markdown("""
@@ -229,3 +342,4 @@ st.markdown("""
     .stDataFrame, .stDataEditor { border-radius: 10px; }
 </style>
 """, unsafe_allow_html=True)
+
